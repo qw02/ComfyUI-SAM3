@@ -550,7 +550,35 @@ class SAM3VideoOutput:
     Changing obj_id does NOT re-run propagation - only this node re-executes.
     """
     # Class-level cache for extraction results
-    _cache = {}
+    _cache: dict = {}
+
+    # Pre-defined color palette as a class constant (avoids recreation)
+    COLORS: torch.Tensor = torch.tensor([
+        [0.0, 0.5, 1.0],   # Blue
+        [1.0, 0.3, 0.3],   # Red
+        [0.3, 1.0, 0.3],   # Green
+        [1.0, 1.0, 0.0],   # Yellow
+        [1.0, 0.0, 1.0],   # Magenta
+        [0.0, 1.0, 1.0],   # Cyan
+        [1.0, 0.5, 0.0],   # Orange
+        [0.5, 0.0, 1.0],   # Purple
+    ], dtype=torch.float32)
+
+    # Pre-defined 3x5 pixel font patterns for digits and punctuation
+    CHAR_PATTERNS: dict = {
+        '0': [[1,1,1], [1,0,1], [1,0,1], [1,0,1], [1,1,1]],
+        '1': [[0,1,0], [1,1,0], [0,1,0], [0,1,0], [1,1,1]],
+        '2': [[1,1,1], [0,0,1], [1,1,1], [1,0,0], [1,1,1]],
+        '3': [[1,1,1], [0,0,1], [1,1,1], [0,0,1], [1,1,1]],
+        '4': [[1,0,1], [1,0,1], [1,1,1], [0,0,1], [0,0,1]],
+        '5': [[1,1,1], [1,0,0], [1,1,1], [0,0,1], [1,1,1]],
+        '6': [[1,1,1], [1,0,0], [1,1,1], [1,0,1], [1,1,1]],
+        '7': [[1,1,1], [0,0,1], [0,0,1], [0,0,1], [0,0,1]],
+        '8': [[1,1,1], [1,0,1], [1,1,1], [1,0,1], [1,1,1]],
+        '9': [[1,1,1], [1,0,1], [1,1,1], [0,0,1], [1,1,1]],
+        ':': [[0,0,0], [0,1,0], [0,0,0], [0,1,0], [0,0,0]],
+        '.': [[0,0,0], [0,0,0], [0,0,0], [0,0,0], [0,1,0]],
+    }
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -580,10 +608,14 @@ class SAM3VideoOutput:
         }
 
     @classmethod
-    def IS_CHANGED(cls, masks, video_state, scores=None, obj_id=-1, plot_all_masks=True):
-        # Always re-run this node when params change, but this is cheap
-        # The key is that changing these here does NOT invalidate upstream cache
-        # ComfyUI caches based on input values - masks/video_state don't change
+    def IS_CHANGED(
+        cls,
+        masks,
+        video_state,
+        scores=None,
+        obj_id: int = -1,
+        plot_all_masks: bool = True
+    ):
         return (id(masks), video_state.session_uuid, id(scores), obj_id, plot_all_masks)
 
     RETURN_TYPES = ("MASK", "IMAGE", "IMAGE")
@@ -591,15 +623,74 @@ class SAM3VideoOutput:
     FUNCTION = "extract"
     CATEGORY = "SAM3/video"
 
-    def _draw_legend(self, vis_frame, num_objects, colors, obj_id=-1, frame_scores=None):
-        """Draw a legend showing object IDs, colors, and confidence scores (sorted by confidence)."""
-        h, w = vis_frame.shape[:2]
+    def _render_text_to_tensor(
+        self,
+        text: str,
+        scale: int
+    ) -> torch.Tensor:
+        """
+        Render text string to a binary tensor using the pixel font.
 
-        # Legend parameters
-        box_size = max(16, min(32, h // 20))
+        Returns a [height, width] float tensor with 1.0 for text pixels.
+        """
+        char_height = 5 * scale
+        char_width = 3 * scale
+        spacing = 1 * scale
+
+        # Calculate total width needed
+        total_width = 0
+        for char in text:
+            if char in self.CHAR_PATTERNS:
+                total_width += char_width + spacing
+            elif char == ' ':
+                total_width += char_width + spacing
+
+        if total_width > 0:
+            total_width -= spacing  # Remove trailing space
+
+        # Create output tensor
+        text_tensor = torch.zeros(char_height, max(1, total_width), dtype=torch.float32)
+
+        curr_x = 0
+        for char in text:
+            if char in self.CHAR_PATTERNS:
+                pattern = self.CHAR_PATTERNS[char]
+                pattern_tensor = torch.tensor(pattern, dtype=torch.float32)
+
+                # Scale up the pattern using nearest-neighbor (repeat)
+                scaled_pattern = pattern_tensor.repeat_interleave(scale, dim=0).repeat_interleave(scale, dim=1)
+
+                # Place into output
+                end_x = min(curr_x + char_width, text_tensor.shape[1])
+                actual_width = end_x - curr_x
+                text_tensor[:, curr_x:end_x] = scaled_pattern[:, :actual_width]
+
+                curr_x += char_width + spacing
+            elif char == ' ':
+                curr_x += char_width + spacing
+
+        return text_tensor
+
+    def _render_legend_overlay(
+        self,
+        height: int,
+        width: int,
+        num_objects: int,
+        obj_id: int,
+        frame_scores: Optional[list],
+        colors: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Render legend as RGB overlay and alpha mask tensors.
+
+        Returns:
+            overlay: [H, W, 3] RGB tensor
+            alpha: [H, W] alpha tensor (0-1)
+        """
+        # Legend parameters scaled to image size
+        box_size = max(16, min(32, height // 20))
         padding = max(4, box_size // 4)
-        text_width = box_size * 6  # Space for "X: 0.95"
-        legend_item_height = box_size + padding
+        scale = max(1, box_size // 6)
 
         # Build list of (obj_id, score) pairs
         if obj_id >= 0:
@@ -613,82 +704,111 @@ class SAM3VideoOutput:
             items.sort(key=lambda x: (x[1] is None, -(x[1] if x[1] is not None else 0)))
 
         num_items = len(items)
-        legend_height = num_items * legend_item_height + padding
-        legend_width = box_size + text_width + padding * 2
+        if num_items == 0:
+            return torch.zeros(height, width, 3), torch.zeros(height, width)
 
-        # Position in top-left corner
-        start_x = padding
-        start_y = padding
+        legend_item_height = box_size + padding
 
-        # Draw semi-transparent background
-        bg_alpha = 0.7
-        for y in range(start_y, min(start_y + legend_height, h)):
-            for x in range(start_x, min(start_x + legend_width, w)):
-                vis_frame[y, x] = vis_frame[y, x] * (1 - bg_alpha) + torch.tensor([0.1, 0.1, 0.1]) * bg_alpha
-
-        # Draw legend items (already sorted by confidence)
-        for idx, (oid, score) in enumerate(items):
-            item_y = start_y + padding + idx * legend_item_height
-
-            # Draw color box
-            color = torch.tensor(colors[oid % len(colors)])
-            for y in range(item_y, min(item_y + box_size, h)):
-                for x in range(start_x + padding, min(start_x + padding + box_size, w)):
-                    vis_frame[y, x] = color
-
-            # Draw "X: 0.95" text using simple pixel font
-            text_x = start_x + padding + box_size + padding
+        # Pre-render all text items and find max width
+        text_renders = []
+        max_text_width = 0
+        for oid, score in items:
             if score is not None:
-                # Format score to 2 decimal places
                 score_str = f"{oid}:{score:.2f}"
             else:
                 score_str = f"{oid}"
-            self._draw_text(vis_frame, score_str, text_x, item_y, box_size)
+            text_tensor = self._render_text_to_tensor(score_str, scale)
+            text_renders.append(text_tensor)
+            max_text_width = max(max_text_width, text_tensor.shape[1])
 
-        return vis_frame
+        # Calculate legend dimensions
+        legend_height = num_items * legend_item_height + padding * 2
+        legend_width = padding + box_size + padding + max_text_width + padding
 
-    def _draw_text(self, img, text, x, y, size):
-        """Draw simple text using basic shapes (no font dependencies)."""
-        # Simple 3x5 pixel font for digits and punctuation
-        chars = {
-            '0': [[1,1,1], [1,0,1], [1,0,1], [1,0,1], [1,1,1]],
-            '1': [[0,1,0], [1,1,0], [0,1,0], [0,1,0], [1,1,1]],
-            '2': [[1,1,1], [0,0,1], [1,1,1], [1,0,0], [1,1,1]],
-            '3': [[1,1,1], [0,0,1], [1,1,1], [0,0,1], [1,1,1]],
-            '4': [[1,0,1], [1,0,1], [1,1,1], [0,0,1], [0,0,1]],
-            '5': [[1,1,1], [1,0,0], [1,1,1], [0,0,1], [1,1,1]],
-            '6': [[1,1,1], [1,0,0], [1,1,1], [1,0,1], [1,1,1]],
-            '7': [[1,1,1], [0,0,1], [0,0,1], [0,0,1], [0,0,1]],
-            '8': [[1,1,1], [1,0,1], [1,1,1], [1,0,1], [1,1,1]],
-            '9': [[1,1,1], [1,0,1], [1,1,1], [0,0,1], [1,1,1]],
-            ':': [[0,0,0], [0,1,0], [0,0,0], [0,1,0], [0,0,0]],
-            '.': [[0,0,0], [0,0,0], [0,0,0], [0,0,0], [0,1,0]],
-        }
+        # Create legend tensors
+        overlay = torch.zeros(height, width, 3, dtype=torch.float32)
+        alpha = torch.zeros(height, width, dtype=torch.float32)
 
-        h, w = img.shape[:2]
-        scale = max(1, size // 6)
-        char_width = 4 * scale
+        # Clamp legend to image bounds
+        leg_h = min(legend_height, height - padding)
+        leg_w = min(legend_width, width - padding)
 
-        curr_x = x
-        for char in text:
-            if char in chars:
-                pattern = chars[char]
-                for row_idx, row in enumerate(pattern):
-                    for col_idx, pixel in enumerate(row):
-                        if pixel:
-                            for sy in range(scale):
-                                for sx in range(scale):
-                                    px = curr_x + col_idx * scale + sx
-                                    py = y + row_idx * scale + sy
-                                    if 0 <= px < w and 0 <= py < h:
-                                        img[py, px] = torch.tensor([1.0, 1.0, 1.0])
-                curr_x += char_width
-            elif char == ' ':
-                curr_x += char_width  # Space
+        # Draw semi-transparent background
+        bg_color = torch.tensor([0.1, 0.1, 0.1], dtype=torch.float32)
+        overlay[padding:padding + leg_h, padding:padding + leg_w, :] = bg_color
+        alpha[padding:padding + leg_h, padding:padding + leg_w] = 0.7
 
-    def extract(self, masks, video_state, scores=None, obj_id=-1, plot_all_masks=True):
-        """Extract all masks as a batch [N, H, W]."""
+        # Draw legend items
+        for idx, ((oid, score), text_tensor) in enumerate(zip(items, text_renders)):
+            item_y = padding + padding + idx * legend_item_height
+
+            if item_y + box_size > height:
+                break
+
+            # Draw color box (vectorized)
+            box_x_start = padding + padding
+            box_x_end = min(box_x_start + box_size, width)
+            box_y_end = min(item_y + box_size, height)
+
+            color = colors[oid % len(colors)]
+            overlay[item_y:box_y_end, box_x_start:box_x_end, :] = color
+            alpha[item_y:box_y_end, box_x_start:box_x_end] = 1.0
+
+            # Draw text (vectorized)
+            text_x = box_x_end + padding
+            text_h, text_w = text_tensor.shape
+            text_x_end = min(text_x + text_w, width)
+            text_y_end = min(item_y + text_h, height)
+            actual_text_w = text_x_end - text_x
+            actual_text_h = text_y_end - item_y
+
+            if actual_text_w > 0 and actual_text_h > 0:
+                text_mask = text_tensor[:actual_text_h, :actual_text_w]
+                # White text
+                for c in range(3):
+                    overlay[item_y:text_y_end, text_x:text_x_end, c] = torch.where(
+                        text_mask > 0.5,
+                        torch.ones_like(text_mask),
+                        overlay[item_y:text_y_end, text_x:text_x_end, c]
+                    )
+                alpha[item_y:text_y_end, text_x:text_x_end] = torch.maximum(
+                    alpha[item_y:text_y_end, text_x:text_x_end],
+                    text_mask
+                )
+
+        return overlay, alpha
+
+    def _load_frame(
+        self,
+        frame_idx: int,
+        temp_dir: str,
+        height: int,
+        width: int
+    ) -> Tuple[int, np.ndarray]:
+        """Load a single frame from disk. Used for parallel loading."""
         from PIL import Image
+        import os
+
+        frame_path = os.path.join(temp_dir, f"{frame_idx:05d}.jpg")
+        if os.path.exists(frame_path):
+            img = Image.open(frame_path).convert("RGB")
+            img_np = np.array(img, dtype=np.float32)
+            img_np *= (1.0 / 255.0)  # In-place normalization
+            return frame_idx, img_np
+        else:
+            return frame_idx, np.zeros((height, width, 3), dtype=np.float32)
+
+    def extract(
+        self,
+        masks,
+        video_state,
+        scores=None,
+        obj_id: int = -1,
+        plot_all_masks: bool = True
+    ):
+        """Extract all masks as a batch [N, H, W]."""
+        from concurrent.futures import ThreadPoolExecutor
+        from functools import partial
         import os
 
         # Create cache key
@@ -701,6 +821,7 @@ class SAM3VideoOutput:
 
         print(f"[SAM3 Video Output] CACHE MISS - extracting masks for session={video_state.session_uuid[:8]}")
         print_vram("Before extract")
+
         h, w = video_state.height, video_state.width
         num_frames = video_state.num_frames
 
@@ -710,148 +831,186 @@ class SAM3VideoOutput:
             empty_frames = torch.zeros(num_frames, h, w, 3)
             return (empty_mask, empty_frames, empty_frames)
 
-        # Process all frames in order
-        mask_list = []
-        frame_list = []
-        vis_list = []
+        # Pre-allocate output tensors (avoids list accumulation and final stack copy)
+        all_masks = torch.zeros(num_frames, h, w, dtype=torch.float32)
+        all_frames = torch.zeros(num_frames, h, w, 3, dtype=torch.float32)
+        all_vis = torch.zeros(num_frames, h, w, 3, dtype=torch.float32)
 
-        # Color palette for multiple objects (RGB, 0-1 range)
-        colors = [
-            [0.0, 0.5, 1.0],   # Blue
-            [1.0, 0.3, 0.3],   # Red
-            [0.3, 1.0, 0.3],   # Green
-            [1.0, 1.0, 0.0],   # Yellow
-            [1.0, 0.0, 1.0],   # Magenta
-            [0.0, 1.0, 1.0],   # Cyan
-            [1.0, 0.5, 0.0],   # Orange
-            [0.5, 0.0, 1.0],   # Purple
-        ]
+        # Get colors tensor (class-level, already created)
+        colors = self.COLORS
 
-        # Track number of objects for legend
+        # Determine number of objects from first available mask
         num_objects = 0
+        for frame_idx in masks:
+            frame_mask = masks[frame_idx]
+            if isinstance(frame_mask, np.ndarray):
+                frame_mask = torch.from_numpy(frame_mask)
+            if frame_mask.dim() == 4:
+                frame_mask = frame_mask.squeeze(0)
+            if frame_mask.dim() == 3 and frame_mask.shape[0] > 0:
+                num_objects = frame_mask.shape[0]
+                break
+            elif frame_mask.dim() == 2:
+                num_objects = 1
+                break
 
+        # Load all frames in parallel
+        print(f"[SAM3 Video Output] Loading {num_frames} frames in parallel...")
+        load_func = partial(
+            self._load_frame,
+            temp_dir=video_state.temp_dir,
+            height=h,
+            width=w
+        )
+
+        # Use ThreadPoolExecutor for parallel I/O (GIL is released during I/O)
+        num_workers = min(16, os.cpu_count() or 4)
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            for frame_idx, img_np in executor.map(load_func, range(num_frames)):
+                all_frames[frame_idx] = torch.from_numpy(img_np)
+
+        print(f"[SAM3 Video Output] Frames loaded. Processing masks...")
+
+        # Process masks - vectorized operations
         for frame_idx in range(num_frames):
-            # Load original frame
-            frame_path = os.path.join(video_state.temp_dir, f"{frame_idx:05d}.jpg")
-            if os.path.exists(frame_path):
-                img = Image.open(frame_path).convert("RGB")
-                img_np = np.array(img).astype(np.float32) / 255.0
-                img_tensor = torch.from_numpy(img_np)  # [H, W, C]
-            else:
-                img_tensor = torch.zeros(h, w, 3)
+            # Start with original frame as base for visualization
+            vis_frame = all_frames[frame_idx].clone()
 
-            frame_list.append(img_tensor)
+            if frame_idx not in masks:
+                # No mask for this frame - output stays as zeros (pre-allocated)
+                all_vis[frame_idx] = vis_frame
+                continue
 
-            # Get mask for this frame
-            if frame_idx in masks:
-                frame_mask = masks[frame_idx]
+            frame_mask = masks[frame_idx]
 
-                # Convert numpy to torch if needed
-                if isinstance(frame_mask, np.ndarray):
-                    frame_mask = torch.from_numpy(frame_mask)
+            # Convert numpy to torch if needed
+            if isinstance(frame_mask, np.ndarray):
+                frame_mask = torch.from_numpy(frame_mask)
 
-                # Convert mask to ComfyUI format
-                if frame_mask.dim() == 4:
-                    frame_mask = frame_mask.squeeze(0)  # Remove batch dim
+            # Remove batch dimension if present
+            if frame_mask.dim() == 4:
+                frame_mask = frame_mask.squeeze(0)
 
-                # Create visualization with colored overlays
-                vis_frame = img_tensor.clone()
+            # Handle empty mask
+            if frame_mask.numel() == 0 or (frame_mask.dim() == 3 and frame_mask.shape[0] == 0):
+                all_vis[frame_idx] = vis_frame
+                continue
 
-                # Check for empty mask (no detections)
-                if frame_mask.numel() == 0 or (frame_mask.dim() == 3 and frame_mask.shape[0] == 0):
-                    # No detections - use empty mask
-                    frame_mask = torch.zeros(h, w)
-                    # vis_frame stays as original image
-                elif frame_mask.dim() == 3 and frame_mask.shape[0] >= 1:
-                    num_objects = max(num_objects, frame_mask.shape[0])
-                    combined_mask = torch.zeros(h, w)
+            # Process multi-object masks [num_objects, H, W]
+            if frame_mask.dim() == 3 and frame_mask.shape[0] >= 1:
+                num_obj_in_frame = frame_mask.shape[0]
 
-                    if plot_all_masks:
-                        # Show ALL objects with different colors
-                        for oid in range(frame_mask.shape[0]):
-                            obj_mask = frame_mask[oid].float()
-                            if obj_mask.numel() > 0 and obj_mask.max() > 1.0:
-                                obj_mask = obj_mask / 255.0
-                            color = torch.tensor(colors[oid % len(colors)])
-                            mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
-                            vis_frame = vis_frame * (1 - 0.5 * obj_mask.unsqueeze(-1)) + 0.5 * mask_rgb
-                            combined_mask = torch.max(combined_mask, obj_mask)
-                    else:
-                        # Show only selected obj_id
-                        vis_oid = obj_id if obj_id >= 0 and obj_id < frame_mask.shape[0] else 0
-                        obj_mask = frame_mask[vis_oid].float()
-                        if obj_mask.numel() > 0 and obj_mask.max() > 1.0:
-                            obj_mask = obj_mask / 255.0
-                        color = torch.tensor(colors[vis_oid % len(colors)])
-                        mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
-                        vis_frame = vis_frame * (1 - 0.5 * obj_mask.unsqueeze(-1)) + 0.5 * mask_rgb
-                        # Still compute combined for mask output
-                        for oid in range(frame_mask.shape[0]):
-                            om = frame_mask[oid].float()
-                            if om.numel() > 0 and om.max() > 1.0:
-                                om = om / 255.0
-                            combined_mask = torch.max(combined_mask, om)
+                # Normalize mask values to 0-1 range
+                frame_mask = frame_mask.float()
+                if frame_mask.max() > 1.0:
+                    frame_mask = frame_mask / 255.0
 
-                    # For mask output, select based on obj_id
-                    if obj_id >= 0 and obj_id < frame_mask.shape[0]:
-                        output_mask = frame_mask[obj_id].float()
-                        if output_mask.numel() > 0 and output_mask.max() > 1.0:
-                            output_mask = output_mask / 255.0
-                    else:
-                        output_mask = combined_mask
-                    frame_mask = output_mask
+                # Create visualization with colored overlays (vectorized)
+                if plot_all_masks:
+                    # Overlay all objects
+                    for oid in range(num_obj_in_frame):
+                        obj_mask = frame_mask[oid]  # [H, W]
+                        if obj_mask.max() < 1e-6:
+                            continue
+
+                        color = colors[oid % len(colors)]  # [3]
+                        # Vectorized blending: vis = vis * (1 - 0.5*mask) + 0.5 * mask * color
+                        mask_expanded = obj_mask.unsqueeze(-1)  # [H, W, 1]
+                        blend_factor = 0.5 * mask_expanded
+                        vis_frame = vis_frame * (1.0 - blend_factor) + blend_factor * color
+
+                    # Combined mask for output
+                    combined_mask = frame_mask.max(dim=0)[0]  # [H, W]
                 else:
-                    # Single mask
-                    if frame_mask.dim() == 3:
-                        frame_mask = frame_mask.squeeze(0)
-                    frame_mask = frame_mask.float()
-                    if frame_mask.numel() > 0 and frame_mask.max() > 1.0:
-                        frame_mask = frame_mask / 255.0
-                    num_objects = max(num_objects, 1)
-                    color = torch.tensor(colors[0])
-                    mask_rgb = frame_mask.unsqueeze(-1) * color.view(1, 1, 3)
-                    vis_frame = vis_frame * (1 - 0.5 * frame_mask.unsqueeze(-1)) + 0.5 * mask_rgb
+                    # Only show selected object in visualization
+                    vis_oid = obj_id if 0 <= obj_id < num_obj_in_frame else 0
+                    obj_mask = frame_mask[vis_oid]
 
-                # Final check for empty masks
-                if frame_mask.numel() == 0:
-                    frame_mask = torch.zeros(h, w)
+                    if obj_mask.max() >= 1e-6:
+                        color = colors[vis_oid % len(colors)]
+                        mask_expanded = obj_mask.unsqueeze(-1)
+                        blend_factor = 0.5 * mask_expanded
+                        vis_frame = vis_frame * (1.0 - blend_factor) + blend_factor * color
 
-                # Draw legend on visualization
-                if num_objects > 0:
-                    legend_obj_id = -1 if plot_all_masks else obj_id
-                    # Get scores for this frame
-                    frame_scores = None
-                    if scores is not None and frame_idx in scores:
-                        frame_scores_tensor = scores[frame_idx]
-                        if hasattr(frame_scores_tensor, 'tolist'):
-                            frame_scores = frame_scores_tensor.tolist()
-                            # Handle nested lists (e.g., [[0.95, 0.87]])
-                            if frame_scores and isinstance(frame_scores[0], list):
-                                frame_scores = frame_scores[0]
-                        elif hasattr(frame_scores_tensor, '__iter__'):
-                            frame_scores = list(frame_scores_tensor)
-                    vis_frame = self._draw_legend(vis_frame, num_objects, colors, obj_id=legend_obj_id, frame_scores=frame_scores)
+                    # Combined mask for output
+                    combined_mask = frame_mask.max(dim=0)[0]
 
-                vis_list.append(vis_frame.clamp(0, 1))
+                # Select output mask based on obj_id
+                if 0 <= obj_id < num_obj_in_frame:
+                    output_mask = frame_mask[obj_id]
+                else:
+                    output_mask = combined_mask
+
+                all_masks[frame_idx] = output_mask
+
             else:
-                # No mask for this frame - use zeros
-                frame_mask = torch.zeros(h, w)
-                vis_list.append(img_tensor)
+                # Single mask [H, W]
+                if frame_mask.dim() == 3:
+                    frame_mask = frame_mask.squeeze(0)
+                frame_mask = frame_mask.float()
+                if frame_mask.max() > 1.0:
+                    frame_mask = frame_mask / 255.0
 
-            mask_list.append(frame_mask.cpu())
+                # Visualize single mask
+                if frame_mask.max() >= 1e-6:
+                    color = colors[0]
+                    mask_expanded = frame_mask.unsqueeze(-1)
+                    blend_factor = 0.5 * mask_expanded
+                    vis_frame = vis_frame * (1.0 - blend_factor) + blend_factor * color
 
-        # Stack into batches
-        all_masks = torch.stack(mask_list, dim=0)  # [N, H, W]
-        all_frames = torch.stack(frame_list, dim=0)  # [N, H, W, C]
-        all_vis = torch.stack(vis_list, dim=0)  # [N, H, W, C]
+                all_masks[frame_idx] = frame_mask
+
+            all_vis[frame_idx] = vis_frame.clamp(0, 1)
+
+            # Periodic progress logging
+            if frame_idx > 0 and frame_idx % 500 == 0:
+                print(f"[SAM3 Video Output] Processed {frame_idx}/{num_frames} frames")
+
+        # Draw legend on all visualization frames (vectorized)
+        if num_objects > 0:
+            print(f"[SAM3 Video Output] Rendering legend overlay...")
+            legend_obj_id = -1 if plot_all_masks else obj_id
+
+            # For each frame, we might have different scores, so we need per-frame legends
+            # But if scores don't vary much, we could optimize further by caching legend renders
+            for frame_idx in range(num_frames):
+                # Get scores for this frame
+                frame_scores = None
+                if scores is not None and frame_idx in scores:
+                    frame_scores_tensor = scores[frame_idx]
+                    if hasattr(frame_scores_tensor, 'tolist'):
+                        frame_scores = frame_scores_tensor.tolist()
+                        if frame_scores and isinstance(frame_scores[0], list):
+                            frame_scores = frame_scores[0]
+                    elif hasattr(frame_scores_tensor, '__iter__'):
+                        frame_scores = list(frame_scores_tensor)
+
+                # Render legend overlay (fully vectorized, no pixel loops)
+                legend_overlay, legend_alpha = self._render_legend_overlay(
+                    h, w, num_objects, legend_obj_id, frame_scores, colors
+                )
+
+                # Composite legend onto visualization (vectorized)
+                alpha_expanded = legend_alpha.unsqueeze(-1)  # [H, W, 1]
+                all_vis[frame_idx] = (
+                    all_vis[frame_idx] * (1.0 - alpha_expanded) +
+                    legend_overlay * alpha_expanded
+                )
 
         print(f"[SAM3 Video] Output: {all_masks.shape[0]} masks, shape {all_masks.shape}")
         print(f"[SAM3 Video] Objects tracked: {num_objects}, plot_all_masks: {plot_all_masks}")
         print_vram("After extract")
 
-        # Cache the result
+        # Cache the result (consider disabling for very large videos)
         result = (all_masks, all_frames, all_vis)
-        SAM3VideoOutput._cache[cache_key] = result
+
+        # Only cache if total size is reasonable (< 8GB)
+        estimated_size_gb = (all_masks.numel() + all_frames.numel() + all_vis.numel()) * 4 / (1024**3)
+        if estimated_size_gb < 1.0:
+            SAM3VideoOutput._cache[cache_key] = result
+            print(f"[SAM3 Video Output] Cached result ({estimated_size_gb:.2f} GB)")
+        else:
+            print(f"[SAM3 Video Output] Skipping cache - result too large ({estimated_size_gb:.2f} GB)")
 
         return result
 
